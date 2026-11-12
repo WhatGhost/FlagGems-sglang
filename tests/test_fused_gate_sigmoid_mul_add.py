@@ -65,10 +65,10 @@ def _rand(*shape, dtype=torch.bfloat16, seed=0):
     ).to(dtype)
 
 
-def _case(num_tokens, hidden, seed=0):
+def _case(num_tokens, hidden, seed=0, weight_shape=None):
     return dict(
         hidden_states=_rand(num_tokens, hidden, seed=seed),
-        gate_weight=_rand(hidden, seed=seed + 1),
+        gate_weight=_rand(*(weight_shape or (hidden,)), seed=seed + 1),
         shared_output=_rand(num_tokens, hidden, seed=seed + 2),
         final_hidden_states=_rand(num_tokens, hidden, seed=seed + 3),
         check=assert_close,
@@ -80,6 +80,8 @@ _CASE_FACTORIES = [
     lambda: _case(13, 2048, seed=4),
     lambda: _case(128, 4096, seed=8),
     lambda: _case(1024, 7168, seed=12),
+    # SGLang's shared_expert_gate is Linear(hidden, 1): a [1, hidden] weight.
+    lambda: _case(8, 2048, seed=16, weight_shape=(1, 2048)),
 ]
 
 CORRECTNESS_CASES = list(range(len(_CASE_FACTORIES)))

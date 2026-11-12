@@ -79,7 +79,12 @@ def _case(
     use_qk_l2norm_in_kernel=True,
     output_final_state=False,
     seed=0,
+    HV=None,
+    model_gates=False,
+    initial_state=False,
+    seq_lens=None,
 ):
+    HV = HV or H
     g = torch.Generator(device=cfg.device).manual_seed(seed)
     q = torch.randn(B, T, H, K, device=cfg.device, generator=g).to(
         torch.bfloat16
@@ -87,14 +92,36 @@ def _case(
     k = torch.randn(B, T, H, K, device=cfg.device, generator=g).to(
         torch.bfloat16
     )
-    v = torch.randn(B, T, H, V, device=cfg.device, generator=g).to(
+    v = torch.randn(B, T, HV, V, device=cfg.device, generator=g).to(
         torch.bfloat16
     )
-    # g is logsigmoid(u), matching the operator's own data generation, so the
-    # decay horizon segmentation the kernel relies on stays valid.
-    u = torch.rand(B, T, H, device=cfg.device, generator=g)
-    gate = torch.nn.functional.logsigmoid(u)
-    beta = torch.rand(B, T, H, device=cfg.device, generator=g)
+    if model_gates:
+        # g = -exp(A_log) * softplus(a + dt_bias) as in Qwen3.5 / Qwen3.6,
+        # whose A_log reaches about -5.4: some heads decay by only ~0.5% per
+        # step, so the state is carried across the whole sequence.
+        A_log = torch.linspace(-5.5, 1.0, HV, device=cfg.device)
+        a = torch.randn(B, T, HV, device=cfg.device, generator=g)
+        gate = -torch.exp(A_log) * torch.nn.functional.softplus(a)
+        beta = torch.sigmoid(
+            torch.randn(B, T, HV, device=cfg.device, generator=g)
+        )
+    else:
+        u = torch.rand(B, T, HV, device=cfg.device, generator=g)
+        gate = torch.nn.functional.logsigmoid(u)
+        beta = torch.rand(B, T, HV, device=cfg.device, generator=g)
+    cu_seqlens = None
+    n_seq = B
+    if seq_lens is not None:
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(seq_lens).cumsum(0).tolist()],
+            device=cfg.device,
+        )
+        n_seq = len(seq_lens)
+    state = None
+    if initial_state:
+        state = 0.05 * torch.randn(
+            n_seq, HV, K, V, device=cfg.device, generator=g
+        )
     scale = K**-0.5
     return dict(
         q=q,
@@ -103,9 +130,9 @@ def _case(
         g=gate,
         beta=beta,
         scale=scale,
-        initial_state=None,
+        initial_state=state,
         output_final_state=output_final_state,
-        cu_seqlens=None,
+        cu_seqlens=cu_seqlens,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         check=_check,
     )
@@ -116,6 +143,44 @@ _CASE_FACTORIES = [
     lambda: _case(2, 128, 4, 128, 128, seed=1),
     lambda: _case(2, 256, 2, 128, 128, output_final_state=True, seed=2),
     lambda: _case(1, 512, 8, 64, 64, seed=3),
+    # Slowly decaying heads, 3 value heads per query/key head (Qwen3.6-27B
+    # per TP=4 rank: 4 and 12).
+    lambda: _case(
+        1,
+        512,
+        4,
+        128,
+        128,
+        output_final_state=True,
+        seed=4,
+        HV=12,
+        model_gates=True,
+    ),
+    lambda: _case(
+        2,
+        300,
+        2,
+        128,
+        128,
+        output_final_state=True,
+        seed=5,
+        model_gates=True,
+        initial_state=True,
+    ),
+    # Packed sequences, as SGLang calls it, including an empty one.
+    lambda: _case(
+        1,
+        421,
+        4,
+        128,
+        128,
+        output_final_state=True,
+        seed=6,
+        HV=8,
+        model_gates=True,
+        initial_state=True,
+        seq_lens=[200, 0, 1, 220],
+    ),
 ]
 
 CORRECTNESS_CASES = list(range(len(_CASE_FACTORIES)))

@@ -396,15 +396,26 @@ def moe_align_block_size(
     cumsum_buffer,
     pad_sorted_token_ids,
 ):
+    # Like sgl_kernel, the results go into the caller's buffers: SGLang reads
+    # those and ignores the return value.
+    buffers = (sorted_token_ids, expert_ids, num_tokens_post_pad)
+    work = tuple(b.contiguous() for b in buffers)
+    _align(topk_ids, num_experts, block_size, *work)
+    for buffer, result in zip(buffers, work):
+        if result is not buffer:
+            buffer.copy_(result)
+    return buffers
+
+
+def _align(topk_ids, num_experts, block_size, out, eids, npost):
+    # eids is read as well as written: blocks past the padded token count
+    # keep their incoming expert ids.
     n = topk_ids.numel()
     k = max(topk_ids.shape[1], 1)
     s0, s1 = topk_ids.stride()
     routed = num_experts - 1
-    ns = sorted_token_ids.numel()
-    en = expert_ids.numel()
-    out = torch.empty_like(sorted_token_ids)
-    eids = torch.empty_like(expert_ids)
-    npost = torch.empty_like(num_tokens_post_pad)
+    ns = out.numel()
+    en = eids.numel()
     if (
         0 < n <= min(64, block_size)
         and block_size <= 1024
@@ -414,7 +425,7 @@ def moe_align_block_size(
         _sorted_direct[max(triton.cdiv(ns, block_size), en, 1),](
             topk_ids,
             out,
-            expert_ids,
+            eids,
             eids,
             npost,
             n,
@@ -431,12 +442,12 @@ def moe_align_block_size(
             triton.next_power_of_2(max(npost.numel(), 1)),
             num_warps=1,
         )
-        return (out, eids, npost)
+        return
     if 0 < n < routed and n <= 1024 and (num_experts <= 1024):
         _input_owner[n + 1,](
             topk_ids,
             out,
-            expert_ids,
+            eids,
             eids,
             npost,
             n,
@@ -454,12 +465,12 @@ def moe_align_block_size(
             triton.next_power_of_2(max(npost.numel(), 1)),
             num_warps=4,
         )
-        return (out, eids, npost)
+        return
     if 0 < n <= 1024 and num_experts <= 1024:
         _small[num_experts,](
             topk_ids,
             out,
-            expert_ids,
+            eids,
             eids,
             npost,
             n,
@@ -477,7 +488,7 @@ def moe_align_block_size(
             triton.next_power_of_2(max(npost.numel(), 1)),
             num_warps=4,
         )
-        return (out, eids, npost)
+        return
     if 1024 < n <= _PLAN_MAX and num_experts <= 1024:
         ps = num_experts
         plan = torch.empty((3, ps), dtype=torch.int32, device=topk_ids.device)
@@ -503,7 +514,7 @@ def moe_align_block_size(
             topk_ids,
             plan,
             out,
-            expert_ids,
+            eids,
             eids,
             n,
             k,
@@ -520,7 +531,7 @@ def moe_align_block_size(
             triton.next_power_of_2(block_size),
             num_warps=4,
         )
-        return (out, eids, npost)
+        return
     offsets = torch.empty(
         (num_experts,), dtype=torch.int32, device=topk_ids.device
     )
@@ -535,7 +546,7 @@ def moe_align_block_size(
         _init_hist[triton.cdiv(size, 1024),](
             topk_ids,
             out,
-            expert_ids,
+            eids,
             eids,
             histograms,
             n,
@@ -586,7 +597,6 @@ def moe_align_block_size(
             256,
             num_warps=4,
         )
-    return (out, eids, npost)
 
 
 __all__ = ["moe_align_block_size"]

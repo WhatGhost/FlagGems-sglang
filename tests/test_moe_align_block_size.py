@@ -70,8 +70,14 @@ def _expert_runs(expert_ids, num_blocks):
     return runs
 
 
-def _make_check(block_size, pad_value):
+_OUTPUT_BUFFERS = ("sorted_token_ids", "expert_ids", "num_tokens_post_pad")
+
+
+def _make_check(block_size, pad_value, buffers):
     def _check(actual, expected):
+        # SGLang ignores the return value and reads the caller's buffers.
+        for buffer, result in zip(buffers, actual):
+            torch.testing.assert_close(buffer, result)
         a_sorted, a_eids, a_npost = actual
         e_sorted, e_eids, e_npost = expected
         torch.testing.assert_close(a_npost, e_npost)
@@ -120,25 +126,24 @@ def _case(num_tokens, top_k, num_experts, block_size, seed=0):
     # Baseline uses triton.cdiv; spelled out to keep triton off the test's
     # import path.
     max_blocks = (max_padded + block_size - 1) // block_size
+    buffers = (
+        torch.full((max_padded,), numel, dtype=torch.int32, device=cfg.device),
+        torch.zeros(max_blocks, dtype=torch.int32, device=cfg.device),
+        torch.zeros(1, dtype=torch.int32, device=cfg.device),
+    )
 
     return dict(
         topk_ids=topk_ids,
         num_experts=arg_experts,
         block_size=block_size,
-        sorted_token_ids=torch.full(
-            (max_padded,), numel, dtype=torch.int32, device=cfg.device
-        ),
-        expert_ids=torch.zeros(
-            max_blocks, dtype=torch.int32, device=cfg.device
-        ),
-        num_tokens_post_pad=torch.zeros(
-            1, dtype=torch.int32, device=cfg.device
-        ),
+        sorted_token_ids=buffers[0],
+        expert_ids=buffers[1],
+        num_tokens_post_pad=buffers[2],
         cumsum_buffer=torch.zeros(
             arg_experts + 1, dtype=torch.int32, device=cfg.device
         ),
         pad_sorted_token_ids=True,
-        check=_make_check(block_size, numel),
+        check=_make_check(block_size, numel, buffers),
     )
 
 
@@ -172,7 +177,13 @@ def test_moe_align_block_size(case_idx):
     kwargs = case if isinstance(case, dict) else {}
 
     # Reference
-    expected = reference(**kwargs)
+    # Both sides write into the output buffers, so the reference fills its
+    # own copies and the candidate fills the case's buffers.
+    reference_kwargs = dict(kwargs)
+    for name in _OUTPUT_BUFFERS:
+        if name in reference_kwargs:
+            reference_kwargs[name] = reference_kwargs[name].clone()
+    expected = reference(**reference_kwargs)
 
     # Operator under test
     try:

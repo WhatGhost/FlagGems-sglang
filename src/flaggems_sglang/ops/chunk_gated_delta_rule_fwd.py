@@ -27,46 +27,32 @@ Architecture
    inside the sequential loop.  They are pure normalizations: the `scale`
    multiply stays in the recurrence kernel and is applied exactly once.
 
-2. `_gdn_fwd_kernel`: the recurrence.  One program owns one
-   (segment, sequence, head) triple and one contiguous block of the value axis.
-   The recurrence is column-separable in V, so V is the only intra-head parallel
-   axis; K cannot be split because the prediction needs the full K reduction at
-   every step.
+2. `_gdn_fwd_kernel`: the recurrence.  One program owns one (sequence, value
+   head) pair and one contiguous block of the value axis, and walks the whole
+   sequence from its initial state.  The recurrence is column-separable in V,
+   so V is the only intra-head parallel axis; K cannot be split because the
+   prediction needs the full K reduction at every step.
 
-Decay-horizon segmentation (fixed-length path only)
----------------------------------------------------
-The state decays by the uniform scalar exp(g_t) every step and g is never
-positive, so the state's dependence on anything L steps earlier is multiplied by
-exp(sum of g over those L steps) <= exp(L * max g).  The operator generates g as
-logsigmoid(u) with u in [0, 1), hence -1.3133 <= g <= -0.6931 = log(1/2); over
-OVL = 64 warm-up steps the carried-in contribution is suppressed by at least
-2**-64 = 5.4e-20, nineteen orders of magnitude below the operator's tolerance.  A
-segment may therefore start from the zero state OVL steps before its output range
-and skip writing the warm-up steps; every other step is the exact fused update.
-Segments are mutually independent, so the serial chain drops from T to
-SEG + OVL steps and the grid widens by about T/SEG, turning the long-sequence
-workloads from a handful of long serial chains into a full part.
+Every step is the exact update.  Starting part-way through a sequence from a
+zero state is not an option: in real models g = -exp(A_log) * softplus(.) gets
+arbitrarily close to 0 (Qwen3.5 / Qwen3.6 have heads with A_log near -5.4,
+about 0.5% decay per step), so the carried-in state never becomes negligible.
 
-Segments whose start is within OVL of their sequence beginning take the true
-initial state and involve no approximation at all, so any sequence no longer than
-SEG + OVL is computed exactly; the packed (cu_seqlens) path is never segmented,
-for the same reason and because its per-sequence boundaries live in a device
-tensor.
+Grouped value heads: v, g and beta may have HV heads for H query/key heads
+(HV a multiple of H); value head hv reads query/key head hv // (HV // H).
 
-State layout: initial_state / final_state are [N, H, K, V] (key axis first), so
-the state is held transposed as [BLOCK_V, BLOCK_K] in registers, which makes both
-reductions (prediction and readout) run along the last axis.  The rank-1 update
-is therefore outer(k, c) with V on the rows.
+State layout: initial_state / final_state are [N, HV, K, V] (key axis first).
+The state is held as [BLOCK_V, BLOCK_K] or [BLOCK_K, BLOCK_V] in registers
+(KV_LAYOUT); which is faster depends on how many programs there are.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-_SEG = 64
-_OVL = 16
+# Measured on gfx1100: about 1024 one-warp programs keep the part busy without
+# re-reading q and k from too many V blocks of the same head.
 _TARGET_PROGS = 1024
-_MAX_BLOCK_V = 16
 
 
 @triton.jit
@@ -116,6 +102,40 @@ def _qk_prep_kernel(
 
 
 @triton.jit
+def _load_step(
+    k_base,
+    q_base,
+    v_base,
+    g_base,
+    b_base,
+    t,
+    seq_end,
+    s_qt,
+    s_vt,
+    s_gt,
+    s_bt,
+    offs_k,
+    mk,
+    offs_v,
+    mv,
+):
+    # A step past the end loads g = beta = 0, which leaves the state as is.
+    m = t < seq_end
+    kt = tl.load(k_base + t * s_qt + offs_k, mask=mk & m, other=0.0)
+    qt = tl.load(q_base + t * s_qt + offs_k, mask=mk & m, other=0.0)
+    vt = tl.load(v_base + t * s_vt + offs_v, mask=mv & m, other=0.0)
+    gt = tl.load(g_base + t * s_gt, mask=m, other=0.0)
+    bt = tl.load(b_base + t * s_bt, mask=m, other=0.0)
+    return (
+        kt.to(tl.float32),
+        qt.to(tl.float32),
+        vt.to(tl.float32),
+        gt.to(tl.float32),
+        bt.to(tl.float32),
+    )
+
+
+@triton.jit
 def _gdn_fwd_kernel(
     q_ptr,
     k_ptr,
@@ -127,13 +147,11 @@ def _gdn_fwd_kernel(
     cu_ptr,
     o_ptr,
     T,
-    H,
+    HV,
+    R,
     K,
     V,
     scale,
-    SEG,
-    OVL,
-    NBH,
     s_qb,
     s_qt,
     s_qh,
@@ -146,30 +164,41 @@ def _gdn_fwd_kernel(
     s_bb,
     s_bt,
     s_bh,
-    s_sn,
-    s_sh,
-    s_sk,
+    s_in,
+    s_ih,
+    s_ik,
+    s_fn,
+    s_fh,
+    s_fk,
     s_ob,
     s_ot,
     s_oh,
     HAS_INIT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     OUT_FINAL: tl.constexpr,
+    KV_LAYOUT: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_V: tl.constexpr,
+    UNROLL: tl.constexpr,
 ):
     pid = tl.program_id(0)
     pid_v = tl.program_id(1)
-    seg = pid // NBH
-    bh = pid % NBH
-    h = bh % H
-    n = bh // H
+    hv = pid % HV
+    n = pid // HV
+    h = hv // R
 
     offs_k = tl.arange(0, BLOCK_K)
     mk = offs_k < K
     offs_v = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
     mv = offs_v < V
-    m_s = mk[:, None] & mv[None, :]
+    if KV_LAYOUT:
+        k_idx = offs_k[:, None]
+        v_idx = offs_v[None, :]
+        m_s = mk[:, None] & mv[None, :]
+    else:
+        k_idx = offs_k[None, :]
+        v_idx = offs_v[:, None]
+        m_s = mv[:, None] & mk[None, :]
 
     if IS_VARLEN:
         seq_begin = tl.load(cu_ptr + n).to(tl.int32)
@@ -180,86 +209,88 @@ def _gdn_fwd_kernel(
         seq_end = T
         b = n
 
-    s0 = seq_begin + seg * SEG
-    t_hi = tl.minimum(s0 + SEG, seq_end)
-    # the OVL steps before the output range are the discarded warm-up
-    t_lo = tl.minimum(tl.maximum(seq_begin, s0 - OVL), t_hi)
-    is_last = (s0 < seq_end) & (s0 + SEG >= seq_end)
-
     q_base = q_ptr + b * s_qb + h * s_qh
     k_base = k_ptr + b * s_qb + h * s_qh
-    v_base = v_ptr + b * s_vb + h * s_vh
-    g_base = g_ptr + b * s_gb + h * s_gh
-    b_base = bt_ptr + b * s_bb + h * s_bh
-    o_base = o_ptr + b * s_ob + h * s_oh
+    v_base = v_ptr + b * s_vb + hv * s_vh
+    g_base = g_ptr + b * s_gb + hv * s_gh
+    b_base = bt_ptr + b * s_bb + hv * s_bh
+    o_base = o_ptr + b * s_ob + hv * s_oh
 
-    s_ptrs = (
-        hi_ptr + n * s_sn + h * s_sh + offs_k[:, None] * s_sk + offs_v[None, :]
-    )
     if HAS_INIT:
-        raw = tl.load(s_ptrs, mask=m_s, other=0.0).to(tl.float32)
-        # the true initial state feeds this segment only when its warm-up window
-        # reaches the beginning of the sequence
-        S = tl.trans(tl.where(t_lo <= seq_begin, raw, 0.0))
+        S = tl.load(
+            hi_ptr + n * s_in + hv * s_ih + k_idx * s_ik + v_idx,
+            mask=m_s,
+            other=0.0,
+        ).to(tl.float32)
+    elif KV_LAYOUT:
+        S = tl.zeros((BLOCK_K, BLOCK_V), dtype=tl.float32)
     else:
         S = tl.zeros((BLOCK_V, BLOCK_K), dtype=tl.float32)
 
-    for t in tl.range(t_lo, t_hi, num_stages=4):
-        kt = tl.load(k_base + t * s_qt + offs_k, mask=mk, other=0.0).to(
-            tl.float32
-        )
-        qt = tl.load(q_base + t * s_qt + offs_k, mask=mk, other=0.0).to(
-            tl.float32
-        )
-        vt = tl.load(v_base + t * s_vt + offs_v, mask=mv, other=0.0).to(
-            tl.float32
-        )
-        gt = tl.load(g_base + t * s_gt).to(tl.float32)
-        bt = tl.load(b_base + t * s_bt).to(tl.float32)
-        qt = qt * scale
+    for t0 in range(seq_begin, seq_end, UNROLL):
+        # Issue the loads of UNROLL steps before the dependent updates.
+        steps = ()
+        for j in tl.static_range(UNROLL):
+            steps += (
+                _load_step(
+                    k_base,
+                    q_base,
+                    v_base,
+                    g_base,
+                    b_base,
+                    t0 + j,
+                    seq_end,
+                    s_qt,
+                    s_vt,
+                    s_gt,
+                    s_bt,
+                    offs_k,
+                    mk,
+                    offs_v,
+                    mv,
+                ),
+            )
+        for j in tl.static_range(UNROLL):
+            kt, qt, vt, gt, bt = steps[j]
+            qt = qt * scale
 
-        # decay, predict k, delta-rule correction, rank-1 update
-        S = S * tl.exp(gt)
-        pred = tl.sum(S * kt[None, :], axis=1)
-        c = bt * (vt - pred)
-        S = S + c[:, None] * kt[None, :]
-
-        # read out with q *after* the update
-        if t >= s0:
-            o = tl.sum(S * qt[None, :], axis=1)
+            # decay, predict k, delta-rule correction, rank-1 update, then
+            # read out with q *after* the update
+            S = S * tl.exp(gt)
+            if KV_LAYOUT:
+                pred = tl.sum(S * kt[:, None], axis=0)
+                c = bt * (vt - pred)
+                S = S + kt[:, None] * c[None, :]
+                o = tl.sum(S * qt[:, None], axis=0)
+            else:
+                pred = tl.sum(S * kt[None, :], axis=1)
+                c = bt * (vt - pred)
+                S = S + c[:, None] * kt[None, :]
+                o = tl.sum(S * qt[None, :], axis=1)
             tl.store(
-                o_base + t * s_ot + offs_v,
+                o_base + (t0 + j) * s_ot + offs_v,
                 o.to(o_ptr.dtype.element_ty),
-                mask=mv,
+                mask=mv & (t0 + j < seq_end),
             )
 
     if OUT_FINAL:
-        if is_last:
-            ho = ho_ptr + n * s_sn + h * s_sh
-            tl.store(
-                ho + offs_k[:, None] * s_sk + offs_v[None, :],
-                tl.trans(S).to(ho_ptr.dtype.element_ty),
-                mask=m_s,
-            )
+        tl.store(
+            ho_ptr + n * s_fn + hv * s_fh + k_idx * s_fk + v_idx,
+            S.to(ho_ptr.dtype.element_ty),
+            mask=m_s,
+        )
 
 
 def _pow2(x):
     return max(16, triton.next_power_of_2(int(x)))
 
 
-def _pick_block_v(chains, v_dim, nseg, target):
-    """BLOCK_V for the V split: enough programs to fill the 78-SM part, but not
-    so many that every V block of the same chain re-reads q, k, g and beta."""
-    total = int(v_dim) * max(1, int(chains)) * max(1, int(nseg))
-    v = max(1, total // max(1, int(target)))
-    return max(
-        4,
-        min(
-            _MAX_BLOCK_V,
-            triton.next_power_of_2(v),
-            triton.next_power_of_2(max(1, int(v_dim))),
-        ),
-    )
+def _pick_layout(chains, v_dim):
+    """(KV_LAYOUT, BLOCK_V) for the V split, measured on gfx1100."""
+    if chains <= 16:
+        return False, 2
+    v = triton.next_power_of_2(max(1, chains * v_dim // _TARGET_PROGS))
+    return True, max(4, min(8, v, triton.next_power_of_2(max(1, v_dim))))
 
 
 def chunk_gated_delta_rule_fwd(
@@ -281,13 +312,25 @@ def chunk_gated_delta_rule_fwd(
             "chunk_gated_delta_rule does not support float32; use bfloat16"
         )
     if beta.dim() != 3:
-        raise AssertionError("beta must be of shape [B, T, H]")
+        raise AssertionError("beta must be of shape [B, T, HV]")
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
     batch, t_len, heads, k_dim = q.shape
-    v_dim = v.shape[-1]
+    v_heads, v_dim = v.shape[2], v.shape[3]
+    if k.shape != q.shape:
+        raise ValueError("q and k must have the same shape")
+    if v.shape[:2] != (batch, t_len) or heads == 0 or v_heads % heads != 0:
+        raise ValueError(
+            "v must be [B, T, HV, V] with HV a multiple of the "
+            f"{heads} query/key heads; got {tuple(v.shape)}"
+        )
+    if g.shape != (batch, t_len, v_heads) or beta.shape != g.shape:
+        raise ValueError(
+            f"g and beta must be of shape {(batch, t_len, v_heads)}; got "
+            f"{tuple(g.shape)} and {tuple(beta.shape)}"
+        )
 
     if cu_seqlens is not None:
         if batch != 1:
@@ -301,27 +344,45 @@ def chunk_gated_delta_rule_fwd(
         n_seq = batch
         has_cu = False
 
-    if initial_state is not None and initial_state.shape[0] != n_seq:
-        raise ValueError(
-            "the number of initial states must equal the number of "
-            f"sequences, i.e. {n_seq} rather than {initial_state.shape[0]}"
-        )
+    state_shape = (n_seq, v_heads, k_dim, v_dim)
+    if initial_state is not None:
+        if initial_state.shape[0] != n_seq:
+            raise ValueError(
+                "the number of initial states must equal the number of "
+                f"sequences, i.e. {n_seq} rather than {initial_state.shape[0]}"
+            )
+        if tuple(initial_state.shape) != state_shape:
+            raise ValueError(
+                f"initial_state must be of shape {state_shape}; got "
+                f"{tuple(initial_state.shape)}"
+            )
+        if initial_state.stride(-1) != 1:
+            initial_state = initial_state.contiguous()
 
     o = torch.empty(
-        (batch, t_len, heads, v_dim), dtype=q.dtype, device=q.device
+        (batch, t_len, v_heads, v_dim), dtype=q.dtype, device=q.device
     )
     if output_final_state:
         final_state = torch.empty(
-            (n_seq, heads, k_dim, v_dim), dtype=torch.float32, device=q.device
+            state_shape, dtype=torch.float32, device=q.device
         )
     else:
         final_state = None
+    if n_seq * v_heads == 0:
+        return o, final_state
+
+    if q.stride(-1) != 1:
+        q = q.contiguous()
+    if k.stride(-1) != 1:
+        k = k.contiguous()
+    if v.stride(-1) != 1:
+        v = v.contiguous()
 
     BLOCK_K = _pow2(k_dim)
     l2norm = bool(use_qk_l2norm_in_kernel)
 
     qk_q, qk_k = q, k
-    if l2norm:
+    if l2norm and t_len:
         rows = batch * t_len * heads
         rpb = max(1, 256 // BLOCK_K)
         prep_grid = (triton.cdiv(rows, rpb),)
@@ -366,40 +427,34 @@ def chunk_gated_delta_rule_fwd(
             num_warps=1,
         )
         qk_q, qk_k = qn, kn
+    elif k.stride() != q.stride():
+        # the scan reads q and k with one set of strides
+        qk_q, qk_k = q.contiguous(), k.contiguous()
 
-    # segment the packed path too: the grid is indexed per sequence with the
-    # sequence bounds read on device, so a host-side segment count of
-    # cdiv(t_len, SEG) is a safe upper bound -- programs whose segment starts
-    # past their sequence's end run an empty loop and write nothing
-    nseg = max(1, (t_len + _SEG - 1) // _SEG)
-    BLOCK_V = _pick_block_v(n_seq * heads, v_dim, nseg, _TARGET_PROGS)
+    kv_layout, BLOCK_V = _pick_layout(n_seq * v_heads, v_dim)
     NV = (v_dim + BLOCK_V - 1) // BLOCK_V
 
-    if initial_state is not None:
-        s_strides = initial_state.stride()
-    elif output_final_state:
-        s_strides = final_state.stride()
-    else:
-        s_strides = (heads * k_dim * v_dim, k_dim * v_dim, v_dim)
+    hi = initial_state if initial_state is not None else o
+    ho = final_state if final_state is not None else o
+    s_i = initial_state.stride()[:3] if initial_state is not None else (0,) * 3
+    s_f = final_state.stride()[:3] if final_state is not None else (0,) * 3
 
-    _gdn_fwd_kernel[(nseg * n_seq * heads, NV)](
+    _gdn_fwd_kernel[(n_seq * v_heads, NV)](
         qk_q,
         qk_k,
         v,
         g,
         beta,
-        initial_state if initial_state is not None else o,
-        final_state if final_state is not None else o,
+        hi,
+        ho,
         cu_seqlens if cu_seqlens is not None else o,
         o,
         t_len,
-        heads,
+        v_heads,
+        v_heads // heads,
         k_dim,
         v_dim,
         scale,
-        _SEG,
-        _OVL,
-        n_seq * heads,
         qk_q.stride(0),
         qk_q.stride(1),
         qk_q.stride(2),
@@ -412,18 +467,23 @@ def chunk_gated_delta_rule_fwd(
         beta.stride(0),
         beta.stride(1),
         beta.stride(2),
-        s_strides[0],
-        s_strides[1],
-        s_strides[2],
+        *s_i,
+        *s_f,
         o.stride(0),
         o.stride(1),
         o.stride(2),
         HAS_INIT=initial_state is not None,
         IS_VARLEN=has_cu,
         OUT_FINAL=output_final_state,
+        KV_LAYOUT=kv_layout,
         BLOCK_K=BLOCK_K,
         BLOCK_V=BLOCK_V,
+        UNROLL=8,
         num_warps=1,
+        # On gfx1100 (Triton 3.6) the software-pipelined loop gave wrong
+        # outputs on the packed path with BLOCK_V=8; UNROLL issues the loads
+        # ahead instead.
+        num_stages=1,
     )
 
     return o, final_state

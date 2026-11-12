@@ -184,7 +184,7 @@ ops:
   - id: chunk_gated_delta_rule_fwd
     description: |
       Chunked gated delta-rule forward (Qwen3-Next / vLLM-Ascend chunk.py).
-      Gated delta-rule recurrence scheduled over decay-horizon segments, with optional in-kernel q/k L2 norm.
+      Exact per-step gated delta-rule recurrence with optional in-kernel q/k L2 norm and grouped value heads (HV a multiple of H).
     for:
       - chunk_gated_delta_rule_fwd
     labels:
@@ -904,6 +904,20 @@ ops:
       Pure layout movement with no arithmetic, so it is bandwidth bound and the problem is address computation.
     for:
       - fused_qkvzba_split_reshape_cat
+    labels:
+      - fused
+      - sglang
+      - Attention
+    kind:
+      - NeuralNetwork
+    stages:
+      - stable: '1.0'
+  - id: fused_qkvzba_split_reshape_cat_contiguous
+    description: |
+      Same outputs as fused_qkvzba_split_reshape_cat for the contiguous projection layout of Qwen3.5 / Qwen3.6,
+      [q | k | v | z] and [b | a], in one launch; any value-to-key head ratio.
+    for:
+      - fused_qkvzba_split_reshape_cat_contiguous
     labels:
       - fused
       - sglang

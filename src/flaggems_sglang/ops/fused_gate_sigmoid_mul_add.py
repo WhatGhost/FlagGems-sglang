@@ -49,6 +49,12 @@ def fused_gate_sigmoid_mul_add(
     hidden_states, gate_weight, shared_output, final_hidden_states
 ):
     n, d = hidden_states.shape
+    # Either [d] or the [1, d] weight of a Linear(d, 1).
+    if gate_weight.numel() != d or gate_weight.shape[-1] != d:
+        raise ValueError(
+            f"gate_weight must hold {d} elements along its last dimension, "
+            f"got shape {tuple(gate_weight.shape)}"
+        )
     output = torch.empty(
         (n, d),
         dtype=final_hidden_states.dtype,
@@ -66,7 +72,7 @@ def fused_gate_sigmoid_mul_add(
         d,
         (
             hidden_states.stride(),
-            gate_weight.stride(),
+            (gate_weight.stride(-1),),
             shared_output.stride(),
             final_hidden_states.stride(),
         ),

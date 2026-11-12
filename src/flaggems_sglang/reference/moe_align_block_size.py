@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-
 
 def reference(
     topk_ids,
@@ -27,11 +25,12 @@ def reference(
 ):
     # ``num_experts`` counts the trailing "filtered expert" slot, which never
     # receives tokens and therefore gets no blocks; only 0..num_experts-2 do.
+    # As in sgl_kernel, the results are written into the three output buffers
+    # (blocks past the padded count keep their expert ids), which are returned.
     num_routed = num_experts - 1
     flat = topk_ids.flatten()
     numel = flat.numel()
-    sorted_ids = torch.full_like(sorted_token_ids, numel)
-    eids = expert_ids.clone()
+    sorted_token_ids.fill_(numel)
 
     offset = 0
     for e in range(num_routed):
@@ -39,12 +38,14 @@ def reference(
         n = idx.numel()
         aligned = ((n + block_size - 1) // block_size) * block_size
         if n:
-            sorted_ids[offset : offset + n] = idx.to(sorted_ids.dtype)
+            sorted_token_ids[offset : offset + n] = idx.to(
+                sorted_token_ids.dtype
+            )
         nblocks = aligned // block_size
         if nblocks:
             beg = offset // block_size
-            eids[beg : beg + nblocks] = e
+            expert_ids[beg : beg + nblocks] = e
         offset += aligned
 
-    npost = torch.full_like(num_tokens_post_pad, offset)
-    return sorted_ids, eids, npost
+    num_tokens_post_pad.fill_(offset)
+    return sorted_token_ids, expert_ids, num_tokens_post_pad

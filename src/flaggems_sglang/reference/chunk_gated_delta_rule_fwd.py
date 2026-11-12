@@ -24,14 +24,15 @@ sequential recurrence. For each head ``h`` and step ``t``::
     S      = S * decay + outer(vcorr, k_t)
     o_t    = S . (q_t * scale)
 
-Shapes: ``q, k`` are ``[B, T, H, K]``; ``v`` is ``[B, T, H, V]``; ``g`` and
-``beta`` are ``[B, T, H]``. ``scale`` defaults to ``K ** -0.5``. With
-``use_qk_l2norm_in_kernel`` the per-step ``q``/``k`` rows are L2-normalized
-before the ``scale`` multiply. Returns ``(output, final_state)`` where
-``final_state`` is ``None`` unless ``output_final_state`` is set.
-
-This reference covers the single-sequence (``cu_seqlens is None``) path used by
-the correctness and benchmark shapes.
+Shapes: ``q, k`` are ``[B, T, H, K]``; ``v`` is ``[B, T, HV, V]``; ``g`` and
+``beta`` are ``[B, T, HV]``, where HV is a multiple of H and value head ``hv``
+reads query/key head ``hv // (HV // H)`` (HV == H is the plain case).
+``scale`` defaults to ``K ** -0.5``. With ``use_qk_l2norm_in_kernel`` the
+per-step ``q``/``k`` rows are L2-normalized before the ``scale`` multiply.
+With ``cu_seqlens`` (B == 1) the T axis packs N sequences, each starting from
+its own ``initial_state[n]``; states are ``[N, HV, K, V]``. Returns
+``(output, final_state)`` where ``final_state`` is ``None`` unless
+``output_final_state`` is set.
 """
 
 import torch
@@ -50,7 +51,8 @@ def reference(
     use_qk_l2norm_in_kernel=False,
 ):
     B, T, H, K = q.shape
-    V = v.shape[-1]
+    HV, V = v.shape[-2], v.shape[-1]
+    group = HV // H
     if scale is None:
         scale = K**-0.5
 
@@ -63,26 +65,34 @@ def reference(
         qf = qf / qf.pow(2).sum(-1, keepdim=True).add(1e-6).sqrt()
         kf = kf / kf.pow(2).sum(-1, keepdim=True).add(1e-6).sqrt()
 
-    out = torch.zeros(B, T, H, V, device=q.device, dtype=torch.float32)
+    if cu_seqlens is None:
+        sequences = [(b, 0, T) for b in range(B)]
+    else:
+        bounds = cu_seqlens.tolist()
+        sequences = [(0, s, e) for s, e in zip(bounds[:-1], bounds[1:])]
+    N = len(sequences)
+
+    out = torch.zeros(B, T, HV, V, device=q.device, dtype=torch.float32)
     if initial_state is None:
-        state = torch.zeros(B, H, K, V, device=q.device, dtype=torch.float32)
+        state = torch.zeros(N, HV, K, V, device=q.device, dtype=torch.float32)
     else:
         state = initial_state.clone().float()
 
-    for b in range(B):
-        for h in range(H):
+    for n, (b, start, end) in enumerate(sequences):
+        for hv in range(HV):
+            h = hv // group
             # S kept as [V, K] internally; initial_state stores [K, V].
-            S = state[b, h].transpose(0, 1).contiguous()
-            for t in range(T):
+            S = state[n, hv].transpose(0, 1).contiguous()
+            for t in range(start, end):
                 kt = kf[b, t, h]
                 qt = qf[b, t, h] * scale
-                vt = vf[b, t, h]
-                decay = torch.exp(gf[b, t, h])
+                vt = vf[b, t, hv]
+                decay = torch.exp(gf[b, t, hv])
                 pred = decay * (S * kt[None, :]).sum(-1)
-                vcorr = (vt - pred) * bf[b, t, h]
+                vcorr = (vt - pred) * bf[b, t, hv]
                 S = S * decay + vcorr[:, None] * kt[None, :]
-                out[b, t, h] = (S * qt[None, :]).sum(-1)
-            state[b, h] = S.transpose(0, 1).contiguous()
+                out[b, t, hv] = (S * qt[None, :]).sum(-1)
+            state[n, hv] = S.transpose(0, 1).contiguous()
 
     final_state = state if output_final_state else None
     return out.to(v.dtype), final_state
